@@ -29,6 +29,7 @@ opencv = "*"
 pandas = ">=2.3.3,<3"
 scikit-image = ">=0.25.2,<0.26"
 scikit-learn = ">=1.7.2,<2"
+pyzmq = ">=27.1.0,<28"
 
 # editable install of SAM3 fork (in this repo root)
 [pypi-dependencies]
