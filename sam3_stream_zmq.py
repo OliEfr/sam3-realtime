@@ -90,7 +90,7 @@ async def main():
                 "type": "add_prompt",
                 "session_id": session_id,
                 "frame_index": 0,
-                "text": "cup"
+                "text": "gray cup"
             })
         
         # Run inference
@@ -100,10 +100,11 @@ async def main():
             "frame_index": frame_idx
         })
         outputs = resp.get("outputs")
+        binary_masks = outputs.get("out_binary_masks") # (n_masks, H, W)
         overlay = render_masklet_frame(frame_rgb, outputs, frame_idx=frame_idx, alpha=0.5) if outputs else frame_rgb
         
         # Publish segmented overlay
-        pub_sock.send(overlay.tobytes())
+        pub_sock.send(binary_masks.tobytes())
 
         # Save output frame
         if SAVE_OUTPUT_FRAMES:
