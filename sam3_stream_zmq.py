@@ -2,6 +2,7 @@
 """SAM3 streaming predictor with async ZMQ frame receiving."""
 
 import os
+import shutil
 import asyncio
 import cv2
 import numpy as np
@@ -49,9 +50,11 @@ async def receive_frames(endpoint: str):
 
 async def main():
     print("Starting SAM3 ZMQ stream receiver...")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if os.path.exists(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR)
     if SAVE_INPUT_FRAMES:
-        os.makedirs(INPUT_FRAMES_DIR, exist_ok=True)
+        os.makedirs(INPUT_FRAMES_DIR)
     
     # Initialize predictor
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,7 +93,7 @@ async def main():
                 "type": "add_prompt",
                 "session_id": session_id,
                 "frame_index": 0,
-                "text": "gray cup"
+                "text": "white and yellow cup"
             })
         
         # Run inference
