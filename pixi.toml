@@ -34,5 +34,6 @@ pyzmq = ">=27.1.0,<28"
 # editable install of SAM3 fork (in this repo root)
 [pypi-dependencies]
 sam3 = { path = ".", editable = true }
+msgpack = "*"
 
 [tasks]

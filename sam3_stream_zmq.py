@@ -13,6 +13,7 @@ import torch
 import zmq
 import zmq.asyncio
 import time
+import msgpack
 
 import sam3
 from sam3.model_builder import build_sam3_stream_predictor
@@ -35,6 +36,13 @@ BATCH_SIZE = len(CAMERA_NAMES)
 async def receive_frame_batches(endpoint: str, batch_size: int, height: int, width: int):
     """Async generator that yields batches of frames from ZMQ.
 
+    Expects msgpack-encoded messages with format:
+        {
+            "prompt": str,           # Text prompt for segmentation
+            "is_first_frame": bool,  # True triggers session reset
+            "frames": bytes          # Raw bytes: (batch_size * height * width * 3) uint8 RGB
+        }
+
     Args:
         endpoint: ZMQ endpoint to bind to.
         batch_size: Number of frames per batch (e.g., number of cameras).
@@ -42,7 +50,7 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
         width: Width of each frame.
 
     Yields:
-        np.ndarray of shape (batch_size, height, width, 3)
+        dict with keys: "prompt", "is_first_frame", "frames" (np.ndarray of shape (batch_size, height, width, 3))
     """
     ctx = zmq.asyncio.Context()
     sock = ctx.socket(zmq.PULL)
@@ -59,13 +67,41 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
                 print("\nReceived END signal")
                 break
 
-            # Reshape to batch of frames
-            if len(msg) != expected_bytes:
-                print(f"Warning: received {len(msg)} bytes, expected {expected_bytes}. Skipping.")
+            # Deserialize msgpack message
+            try:
+                data = msgpack.unpackb(msg, raw=False)
+            except msgpack.UnpackException as e:
+                print(f"Warning: failed to unpack msgpack message: {e}. Skipping.")
                 continue
 
-            frame_batch = np.frombuffer(msg, dtype=np.uint8).reshape((batch_size, height, width, 3))
-            yield frame_batch
+            prompt = data.get("prompt", "")
+            is_first_frame = data.get("is_first_frame", False)
+            reset_model = data.get("reset_model", False)
+            frame_bytes = data.get("frames", b"")
+
+            # Handle reset_model message - create dummy frames to bypass validation
+            if reset_model:
+                dummy_frame_batch = np.zeros((batch_size, height, width, 3), dtype=np.uint8)
+                yield {
+                    "prompt": "",
+                    "is_first_frame": False,
+                    "frames": dummy_frame_batch,
+                    "reset_model": True
+                }
+                continue
+
+            # Validate frame bytes
+            if len(frame_bytes) != expected_bytes:
+                print(f"Warning: received {len(frame_bytes)} frame bytes, expected {expected_bytes}. Skipping.")
+                continue
+
+            frame_batch = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((batch_size, height, width, 3))
+            yield {
+                "prompt": prompt,
+                "is_first_frame": is_first_frame,
+                "frames": frame_batch,
+                "reset_model": reset_model
+            }
     finally:
         sock.close()
         ctx.term()
@@ -114,25 +150,59 @@ async def main_batch():
         print(f"Started session for camera '{cam_name}': {resp['session_id']}")
 
     frame_idx = 0
+    episode_idx = 0
     processed = 0
     peak_memory = 0.0
     start_time = time.time()
+    current_prompt = ""
 
     # Publisher socket for segmented masks
     pub_ctx = zmq.Context()
     pub_sock = pub_ctx.socket(zmq.PUB)
+    pub_sock.setsockopt(zmq.LINGER, 0)  # Allow immediate close without blocking
     pub_sock.bind(ZMQ_PUB_ENDPOINT)
     print(f"Publisher bound to {ZMQ_PUB_ENDPOINT}")
 
-    async for frame_batch in receive_frame_batches(ZMQ_RECV_ENDPOINT, BATCH_SIZE, HEIGHT, WIDTH):
+    async for msg in receive_frame_batches(ZMQ_RECV_ENDPOINT, BATCH_SIZE, HEIGHT, WIDTH):
         start_batch = time.time()
-        
+
+        # Extract message fields
+        prompt = msg["prompt"]
+        is_first_frame = msg["is_first_frame"]
+        frame_batch = msg["frames"]
+        reset_model = msg.get("reset_model", False)
+
+        # Handle reset_model request
+        if reset_model:
+            for session_id in session_ids:
+                predictor.handle_request({"type": "reset_session", "session_id": session_id})
+            # Clear the publish socket queue by closing and recreating it
+            pub_sock.setsockopt(zmq.LINGER, 0)  # Discard pending messages immediately
+            pub_sock.close()
+            time.sleep(0.1)  # Brief pause to ensure socket is closed
+            pub_sock = pub_ctx.socket(zmq.PUB)
+            pub_sock.setsockopt(zmq.LINGER, 0)
+            pub_sock.bind(ZMQ_PUB_ENDPOINT)
+            print("Received reset_model signal. All sessions reset and publish queue cleared")
+            continue  # Skip to next message
+
+        # Handle new episode (first frame of new sequence)
+        if is_first_frame:
+            # Only reset sessions if we've already processed at least one episode
+            # (fresh sessions don't have state to reset)
+            if episode_idx > 0:
+                for session_id in session_ids:
+                    predictor.handle_request({"type": "reset_session", "session_id": session_id})
+            print(f"\nNew episode {episode_idx + 1} started, sessions reset. Prompt: '{prompt}'")
+            episode_idx += 1
+            frame_idx = 0
+            current_prompt = prompt
 
         # Save input frames
         if SAVE_FRAMES:
             for i, cam_name in enumerate(CAMERA_NAMES):
                 cv2.imwrite(
-                    os.path.join(INPUT_FRAMES_DIR, cam_name, f"input_{frame_idx:05d}.png"),
+                    os.path.join(INPUT_FRAMES_DIR, cam_name, f"input_{episode_idx:03d}_{frame_idx:05d}.png"),
                     cv2.cvtColor(frame_batch[i], cv2.COLOR_RGB2BGR)
                 )
 
@@ -142,8 +212,8 @@ async def main_batch():
             for i in range(BATCH_SIZE)
         ]
 
-        if frame_idx == 0:
-            # First frame: add frames, then prompts, then run inference
+        if is_first_frame:
+            # First frame of episode: add frames, then prompts, then run inference
             # (prompts must be added AFTER frames exist)
             predictor.batch_add_frame(frames=batch_requests)
             for session_id in session_ids:
@@ -151,7 +221,7 @@ async def main_batch():
                     "type": "add_prompt",
                     "session_id": session_id,
                     "frame_index": 0,
-                    "text": "a mug"
+                    "text": current_prompt
                 })
             batch_resp = predictor.batch_run_inference(
                 sessions=[{"session_id": sid} for sid in session_ids]
@@ -188,7 +258,7 @@ async def main_batch():
                         frame_batch[i], outputs, frame_idx=result["frame_index"], alpha=0.5
                     )
                     cv2.imwrite(
-                        os.path.join(OUTPUT_DIR, f"output_{CAMERA_NAMES[i]}_{frame_idx:05d}.png"),
+                        os.path.join(OUTPUT_DIR, f"output_{CAMERA_NAMES[i]}_{episode_idx:03d}_{frame_idx:05d}.png"),
                         cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
                     )
             else:
@@ -208,7 +278,7 @@ async def main_batch():
         peak_memory = max(peak_memory, current_peak)
         end_batch = time.time()
 
-        print(f"Batch {frame_idx}, Frames: {processed}, Peak mem: {current_peak:.2f} GB, FPS (per batch): {1/(end_batch - start_batch):.2f}", end="\r")
+        print(f"Ep {episode_idx} Frame {frame_idx}, Total: {processed}, Peak mem: {current_peak:.2f} GB, FPS: {1/(end_batch - start_batch):.2f}")
 
     # Cleanup
     pub_sock.close()
@@ -249,6 +319,7 @@ async def main_single():
     # Publisher socket for segmented masks
     pub_ctx = zmq.Context()
     pub_sock = pub_ctx.socket(zmq.PUB)
+    pub_sock.setsockopt(zmq.LINGER, 0)  # Allow immediate close without blocking
     pub_sock.bind(ZMQ_PUB_ENDPOINT)
     print(f"Publisher bound to {ZMQ_PUB_ENDPOINT}")
 
