@@ -14,6 +14,8 @@ import zmq
 import zmq.asyncio
 import time
 import msgpack
+import threading
+import queue
 
 import sam3
 from sam3.model_builder import build_sam3_stream_predictor
@@ -25,12 +27,18 @@ ZMQ_PUB_ENDPOINT = "tcp://*:5556"
 OUTPUT_DIR = "outputs/real_time/zmq_stream"
 INPUT_FRAMES_DIR = os.path.join(OUTPUT_DIR, "input_frames")
 OUTPUT_VIDEO = os.path.join(OUTPUT_DIR, "zmq_stream.mp4")
-SAVE_FRAMES = True
+SAVE_FRAMES = False
 FPS = 30
-WIDTH, HEIGHT = 960, 540
+WIDTH, HEIGHT = 256, 256
 
 CAMERA_NAMES = ["first_person", "third_person"]
+# CAMERA_NAMES = [ "third_person"]
 BATCH_SIZE = len(CAMERA_NAMES)
+
+# Visualization configuration
+ENABLE_VISUALIZATION = True  # Set to True to enable real-time display
+VIZ_QUEUE_SIZE = 5  # Small queue - drop old frames if viewer is slow
+VIZ_WINDOW_NAME = "SAM3 Third-Person View"
 
 
 async def receive_frame_batches(endpoint: str, batch_size: int, height: int, width: int):
@@ -126,6 +134,108 @@ async def receive_frames(endpoint: str):
         ctx.term()
 
 
+class VisualizationThread:
+    """Non-blocking visualization thread for displaying overlay frames.
+
+    Runs independently from the main async loop to avoid blocking SAM3 processing.
+    """
+
+    def __init__(self, window_name: str, queue_size: int = 5):
+        """Initialize the visualization thread.
+
+        Args:
+            window_name: Name of the cv2 window.
+            queue_size: Max frames to buffer (older frames dropped on overflow).
+        """
+        self.window_name = window_name
+        self.frame_queue = queue.Queue(maxsize=queue_size)
+        self.thread = None
+        self.running = False
+        self.stop_event = threading.Event()
+
+    def start(self):
+        """Start the visualization thread."""
+        if self.thread is not None:
+            return  # Already running
+
+        self.running = True
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        print(f"Visualization thread started (window: '{self.window_name}')")
+
+    def _run(self):
+        """Thread worker - displays frames from queue."""
+        while not self.stop_event.is_set():
+            try:
+                # Wait for frame with timeout to allow checking stop_event
+                frame_bgr, frame_info = self.frame_queue.get(timeout=0.1)
+
+                # Display the frame
+                try:
+                    cv2.imshow(self.window_name, frame_bgr)
+                except cv2.error as e:
+                    print(f"cv2.imshow failed (no display?): {e}")
+                    print("Stopping visualization - consider running without --viz flag")
+                    break
+
+                # waitKey(1) processes GUI events and returns key code
+                # This MUST be called in the same thread as imshow
+                key = cv2.waitKey(1) & 0xFF
+
+                # Optional: Allow 'q' to request shutdown
+                if key == ord('q'):
+                    print("\nVisualization window closed by user (pressed 'q')")
+                    break
+
+            except queue.Empty:
+                # No frame available, continue waiting
+                continue
+            except Exception as e:
+                print(f"Visualization thread error: {e}")
+                break
+
+        # Cleanup
+        cv2.destroyWindow(self.window_name)
+        self.running = False
+        print("Visualization thread stopped")
+
+    def put_frame(self, frame_bgr: np.ndarray, frame_info: dict = {}):
+        """Put a frame in the display queue (non-blocking).
+
+        Args:
+            frame_bgr: Frame in BGR format (cv2 convention).
+            frame_info: Optional metadata (episode_idx, frame_idx, etc.).
+
+        Returns:
+            bool: True if frame was added, False if queue is full (frame dropped).
+        """
+        if not self.running:
+            return False
+
+        try:
+            # Put without blocking - raises queue.Full if queue is full
+            self.frame_queue.put_nowait((frame_bgr, frame_info))
+            return True
+        except queue.Full:
+            # Queue is full - drop this frame (acceptable per requirements)
+            return False
+
+    def stop(self):
+        """Stop the visualization thread gracefully."""
+        if not self.running:
+            return
+
+        print("Stopping visualization thread...")
+        self.stop_event.set()
+
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)  # Wait up to 2s for thread to finish
+            if self.thread.is_alive():
+                print("Warning: Visualization thread did not stop cleanly")
+            self.thread = None
+
+
 async def main_batch():
     """Main loop for batch (multi-camera) processing."""
     print(f"Starting SAM3 ZMQ stream receiver (BATCH MODE: {BATCH_SIZE} cameras)...")
@@ -161,6 +271,14 @@ async def main_batch():
     pub_sock.setsockopt(zmq.LINGER, 0)  # Allow immediate close without blocking
     pub_sock.bind(ZMQ_PUB_ENDPOINT)
     print(f"Publisher bound to {ZMQ_PUB_ENDPOINT}")
+
+    
+    if ENABLE_VISUALIZATION:
+        viz_thread = VisualizationThread(
+            window_name=VIZ_WINDOW_NAME,
+            queue_size=VIZ_QUEUE_SIZE
+        )
+        viz_thread.start()
 
     async for msg in receive_frame_batches(ZMQ_RECV_ENDPOINT, BATCH_SIZE, HEIGHT, WIDTH):
         start_batch = time.time()
@@ -256,15 +374,25 @@ async def main_batch():
                     # No masks detected - add empty mask
                     first_masks.append(np.zeros((HEIGHT, WIDTH), dtype=np.uint8))
 
-                # Save output frame
-                if SAVE_FRAMES and CAMERA_NAMES[i] == "third_person": # only save third persons view as it is more useful
+                # Save and/or display output frame for third_person camera
+                if SAVE_FRAMES:
                     overlay = render_masklet_frame(
                         frame_batch[i], outputs, frame_idx=result["frame_index"], alpha=0.5
                     )
+
                     cv2.imwrite(
                         os.path.join(OUTPUT_DIR, f"output_{CAMERA_NAMES[i]}_{episode_idx:03d}_{frame_idx:05d}.png"),
                         cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
                     )
+
+                    # Display in window (non-blocking)
+                    if CAMERA_NAMES[i] == "third_person" and ENABLE_VISUALIZATION:
+                        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+                        viz_thread.put_frame(overlay_bgr, {
+                            "episode": episode_idx,
+                            "frame": frame_idx,
+                            "camera": CAMERA_NAMES[i]
+                        })
             else:
                 # No outputs - add empty mask
                 first_masks.append(np.zeros((HEIGHT, WIDTH), dtype=np.uint8))
@@ -289,6 +417,10 @@ async def main_batch():
     pub_ctx.term()
     for session_id in session_ids:
         predictor.handle_request({"type": "close_session", "session_id": session_id})
+
+    # Cleanup visualization thread
+    if viz_thread is not None:
+        viz_thread.stop()
 
     elapsed = time.time() - start_time
     print(f"\nProcessed {processed} frames ({frame_idx} batches) in {elapsed:.2f}s => {processed/elapsed:.2f} FPS (per batch)")
@@ -392,7 +524,7 @@ async def main_single():
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="SAM3 ZMQ Stream Receiver")
-    args = parser.parse_args()
+   
 
     asyncio.run(main_batch())
     # LEGACY single-camera mode
