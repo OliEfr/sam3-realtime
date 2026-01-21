@@ -27,12 +27,12 @@ ZMQ_PUB_ENDPOINT = "tcp://*:5556"
 OUTPUT_DIR = "outputs/real_time/zmq_stream"
 INPUT_FRAMES_DIR = os.path.join(OUTPUT_DIR, "input_frames")
 OUTPUT_VIDEO = os.path.join(OUTPUT_DIR, "zmq_stream.mp4")
-SAVE_FRAMES = False
+SAVE_FRAMES = True
 FPS = 30
 WIDTH, HEIGHT = 256, 256
 
-CAMERA_NAMES = ["first_person", "third_person"]
-# CAMERA_NAMES = [ "third_person"]
+CAMERA_NAMES = ["1st_person", "3rd_person"]
+# CAMERA_NAMES = [ "3rd_person"]
 BATCH_SIZE = len(CAMERA_NAMES)
 
 # Visualization configuration
@@ -46,7 +46,7 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
 
     Expects msgpack-encoded messages with format:
         {
-            "prompt": str,           # Text prompt for segmentation
+            "prompt": str or dict,   # dict: {camera_name: prompt} for per-camera prompts
             "is_first_frame": bool,  # True triggers session reset
             "frames": bytes          # Raw bytes: (batch_size * height * width * 3) uint8 RGB
         }
@@ -82,16 +82,29 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
                 print(f"Warning: failed to unpack msgpack message: {e}. Skipping.")
                 continue
 
-            prompt = data.get("prompt", "")
+            prompt_field = data.get("prompt", "")
             sam3_stage = data.get("sam3_stage", 0)
             reset_model = data.get("reset_model", False)
             frame_bytes = data.get("frames", b"")
+
+            prompts = {}
+            print(prompt_field)
+            if prompt_field == "" or prompt_field is None or not prompt_field or prompt_field == {}:
+                prompts = {camera: "" for camera in CAMERA_NAMES}
+            elif isinstance(prompt_field, dict):
+                for camera in CAMERA_NAMES:
+                    if camera in prompt_field:
+                        prompts[camera] = prompt_field[camera]
+                    else:
+                        raise ValueError(f"Missing prompt for camera '{camera}' in prompt dict.")
+            else:
+                raise ValueError(f"Invalid prompt field: {prompt_field}")
 
             # Handle reset_model message - create dummy frames to bypass validation
             if reset_model:
                 dummy_frame_batch = np.zeros((batch_size, height, width, 3), dtype=np.uint8)
                 yield {
-                    "prompt": "",
+                    "prompt": {camera: "" for camera in CAMERA_NAMES},
                     "sam3_stage": -1,
                     "frames": dummy_frame_batch,
                     "reset_model": True
@@ -103,7 +116,7 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
 
             frame_batch = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((batch_size, height, width, 3))
             yield {
-                "prompt": prompt,
+                "prompt": prompts,  # dict mapping camera names to prompts
                 "sam3_stage": sam3_stage,
                 "frames": frame_batch,
                 "reset_model": reset_model
@@ -190,6 +203,11 @@ class VisualizationThread:
 
             except queue.Empty:
                 # No frame available, continue waiting
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("\nVisualization window closed by user (pressed 'q')")
+                    break
+                continue
                 continue
             except Exception as e:
                 print(f"Visualization thread error: {e}")
@@ -262,7 +280,7 @@ async def main_batch():
     processed = 0
     peak_memory = 0.0
     start_time = time.time()
-    current_prompt = ""
+    current_prompts = {camera: "" for camera in CAMERA_NAMES}
     current_sam3_stage = -1  # Initialize to -1 --> first message triggers reset
 
     # Publisher socket for segmented masks
@@ -284,7 +302,7 @@ async def main_batch():
         start_batch = time.time()
 
         # Extract message fields
-        prompt = msg["prompt"]
+        prompts = msg["prompt"]  # dict mapping camera names to prompts
         sam3_stage = msg["sam3_stage"]
         frame_batch = msg["frames"]
         reset_model = msg.get("reset_model", False)
@@ -316,9 +334,9 @@ async def main_batch():
         # Handle sam3_stage increase (stage transition within episode)
         if is_new_stage:
             # Only reset sessions if they've processed at least one frame
-            print(f"[NEW STAGE] SAM3 stage increased: {current_sam3_stage} -> {sam3_stage}, resetting sessions. Prompt: '{prompt}'")
+            print(f"[NEW STAGE] SAM3 stage increased: {current_sam3_stage} -> {sam3_stage}, resetting sessions. Prompts: {prompts}")
             current_sam3_stage = sam3_stage
-            current_prompt = prompt
+            current_prompts = prompts
 
         # Save input frames
         if SAVE_FRAMES:
@@ -338,12 +356,13 @@ async def main_batch():
             # First frame of new stage: add frames, then prompts, then run inference
             # (prompts must be added AFTER frames exist)
             predictor.batch_add_frame(frames=batch_requests)
-            for session_id in session_ids:
+            for i, session_id in enumerate(session_ids):
+                camera_name = CAMERA_NAMES[i]
                 predictor.handle_request({
                     "type": "add_prompt",
                     "session_id": session_id,
                     "frame_index": 0,
-                    "text": current_prompt
+                    "text": current_prompts[camera_name]  # Different per camera
                 })
             batch_resp = predictor.batch_run_inference(
                 sessions=[{"session_id": sid} for sid in session_ids]
@@ -374,25 +393,25 @@ async def main_batch():
                     # No masks detected - add empty mask
                     first_masks.append(np.zeros((HEIGHT, WIDTH), dtype=np.uint8))
 
-                # Save and/or display output frame for third_person camera
-                if SAVE_FRAMES:
-                    overlay = render_masklet_frame(
-                        frame_batch[i], outputs, frame_idx=result["frame_index"], alpha=0.5
-                    )
+                # Save and/or display output frame for 3rd_person camera
+                overlay = render_masklet_frame(
+                    frame_batch[i], outputs, frame_idx=result["frame_index"], alpha=0.5
+                )
 
+                if SAVE_FRAMES:
                     cv2.imwrite(
                         os.path.join(OUTPUT_DIR, f"output_{CAMERA_NAMES[i]}_{episode_idx:03d}_{frame_idx:05d}.png"),
                         cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
                     )
 
-                    # Display in window (non-blocking)
-                    if CAMERA_NAMES[i] == "third_person" and ENABLE_VISUALIZATION:
-                        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-                        viz_thread.put_frame(overlay_bgr, {
-                            "episode": episode_idx,
-                            "frame": frame_idx,
-                            "camera": CAMERA_NAMES[i]
-                        })
+                # Display in window (non-blocking)
+                if CAMERA_NAMES[i] == "3rd_person" and ENABLE_VISUALIZATION:
+                    overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+                    viz_thread.put_frame(overlay_bgr, {
+                        "episode": episode_idx,
+                        "frame": frame_idx,
+                        "camera": CAMERA_NAMES[i]
+                    })
             else:
                 # No outputs - add empty mask
                 first_masks.append(np.zeros((HEIGHT, WIDTH), dtype=np.uint8))
@@ -410,7 +429,7 @@ async def main_batch():
         peak_memory = max(peak_memory, current_peak)
         end_batch = time.time()
 
-        print(f"Ep {episode_idx} Frame {frame_idx}, Total: {processed}, Peak mem: {current_peak:.2f} GB, FPS: {1/(end_batch - start_batch):.2f}")
+        print(f"Ep {episode_idx} Frame {frame_idx}, Total: {processed}, Peak mem: {current_peak:.2f} GB, FPS: {1/(end_batch - start_batch):.2f}, Prompts: {current_prompts}")
 
     # Cleanup
     pub_sock.close()
