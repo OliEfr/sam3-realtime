@@ -47,9 +47,11 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
     Expects msgpack-encoded messages with format:
         {
             "prompt": str or dict,   # dict: {camera_name: prompt} for per-camera prompts
-            "is_first_frame": bool,  # True triggers session reset
+            "reset_model": bool,     # True triggers episode reset
             "frames": bytes          # Raw bytes: (batch_size * height * width * 3) uint8 RGB
         }
+
+    Note: Prompt changes are detected automatically by comparing with previous prompts.
 
     Args:
         endpoint: ZMQ endpoint to bind to.
@@ -58,7 +60,7 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
         width: Width of each frame.
 
     Yields:
-        dict with keys: "prompt", "is_first_frame", "frames" (np.ndarray of shape (batch_size, height, width, 3))
+        dict with keys: "prompt", "reset_model", "frames" (np.ndarray of shape (batch_size, height, width, 3))
     """
     ctx = zmq.asyncio.Context()
     sock = ctx.socket(zmq.PULL)
@@ -83,7 +85,6 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
                 continue
 
             prompt_field = data.get("prompt", "")
-            sam3_stage = data.get("sam3_stage", 0)
             reset_model = data.get("reset_model", False)
             frame_bytes = data.get("frames", b"")
 
@@ -105,7 +106,6 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
                 dummy_frame_batch = np.zeros((batch_size, height, width, 3), dtype=np.uint8)
                 yield {
                     "prompt": {camera: "" for camera in CAMERA_NAMES},
-                    "sam3_stage": -1,
                     "frames": dummy_frame_batch,
                     "reset_model": True
                 }
@@ -117,7 +117,6 @@ async def receive_frame_batches(endpoint: str, batch_size: int, height: int, wid
             frame_batch = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((batch_size, height, width, 3))
             yield {
                 "prompt": prompts,  # dict mapping camera names to prompts
-                "sam3_stage": sam3_stage,
                 "frames": frame_batch,
                 "reset_model": reset_model
             }
@@ -281,7 +280,6 @@ async def main_batch():
     peak_memory = 0.0
     start_time = time.time()
     current_prompts = {camera: "" for camera in CAMERA_NAMES}
-    current_sam3_stage = -1  # Initialize to -1 --> first message triggers reset
 
     # Publisher socket for segmented masks
     pub_ctx = zmq.Context()
@@ -303,16 +301,16 @@ async def main_batch():
 
         # Extract message fields
         prompts = msg["prompt"]  # dict mapping camera names to prompts
-        sam3_stage = msg["sam3_stage"]
         frame_batch = msg["frames"]
         reset_model = msg.get("reset_model", False)
 
 
-        is_new_stage = sam3_stage > current_sam3_stage
+        is_new_prompt = prompts != current_prompts
 
-        # handle session resets for new stage or new episode
-        if reset_model or is_new_stage: 
-            if current_sam3_stage >= 0:
+        # handle session resets for new prompt or new episode
+        if reset_model or is_new_prompt:
+            # Only reset sessions if we've processed at least one frame
+            if current_prompts != {camera: "" for camera in CAMERA_NAMES}:
                 for session_id in session_ids:
                     predictor.handle_request({"type": "reset_session", "session_id": session_id})
 
@@ -325,17 +323,14 @@ async def main_batch():
             pub_sock = pub_ctx.socket(zmq.PUB)
             pub_sock.setsockopt(zmq.LINGER, 0)
             pub_sock.bind(ZMQ_PUB_ENDPOINT)
-            current_sam3_stage = -1  # Reset stage counter for new episode
             episode_idx += 1
             frame_idx = 0
             print(f"[RESET EPISODE]: Episode {episode_idx}: reset_model received.")
             continue  # Skip to next message
 
-        # Handle sam3_stage increase (stage transition within episode)
-        if is_new_stage:
-            # Only reset sessions if they've processed at least one frame
-            print(f"[NEW STAGE] SAM3 stage increased: {current_sam3_stage} -> {sam3_stage}, resetting sessions. Prompts: {prompts}")
-            current_sam3_stage = sam3_stage
+        # Handle prompt change (triggers session reset)
+        if is_new_prompt:
+            print(f"[PROMPT CHANGE] Detected prompt change, resetting sessions. Old: {current_prompts}, New: {prompts}")
             current_prompts = prompts
 
         # Save input frames
@@ -352,8 +347,8 @@ async def main_batch():
             for i in range(BATCH_SIZE)
         ]
 
-        if is_new_stage:
-            # First frame of new stage: add frames, then prompts, then run inference
+        if is_new_prompt:
+            # First frame after prompt change: add frames, then prompts, then run inference
             # (prompts must be added AFTER frames exist)
             predictor.batch_add_frame(frames=batch_requests)
             for i, session_id in enumerate(session_ids):
